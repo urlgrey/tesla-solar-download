@@ -28,6 +28,7 @@ import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytz
 import teslapy
 
 # Add project root to path
@@ -130,7 +131,63 @@ def poll_live_status(tesla, site_id):
         return None
 
 
-def publish_mqtt(site_id, data, sun_status=None):
+def poll_energy_today(tesla, site_id):
+    """
+    Poll today's energy totals via CALENDAR_HISTORY_DATA.
+
+    Returns a dict with cumulative Wh values for today, or None on failure.
+    """
+    try:
+        # Get site timezone
+        site_config = tesla.api(
+            'SITE_CONFIG',
+            path_vars={'site_id': site_id},
+        )['response']
+        tz_name = site_config.get('installation_time_zone', 'America/Los_Angeles')
+        tz = pytz.timezone(tz_name)
+
+        now = datetime.now(tz)
+        start_date = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        end_date = now.replace(hour=23, minute=59, second=59, microsecond=0).isoformat()
+
+        response = tesla.api(
+            'CALENDAR_HISTORY_DATA',
+            path_vars={'site_id': site_id},
+            kind='energy',
+            period='day',
+            start_date=start_date,
+            end_date=end_date,
+            time_zone=tz_name,
+        )['response']
+
+        if not response or 'time_series' not in response:
+            logger.warning('No energy time_series in response')
+            return None
+
+        # Sum all intervals in today's time series
+        totals = {
+            'solar_energy_exported': 0,
+            'grid_energy_imported': 0,
+            'grid_energy_exported_from_solar': 0,
+            'battery_energy_exported': 0,
+            'battery_energy_imported_from_solar': 0,
+            'consumer_energy_imported_from_solar': 0,
+        }
+
+        for entry in response['time_series']:
+            for key in totals:
+                totals[key] += entry.get(key, 0)
+
+        totals['timestamp'] = now.isoformat()
+        return totals
+
+    except Exception as e:
+        logger.error(f'Failed to poll energy totals for site {site_id}: {e}')
+        traceback.print_exc()
+        return None
+
+
+def publish_mqtt(site_id, data, sun_status=None, energy_data=None):
     """Publish live data to MQTT for Home Assistant."""
     if not Config.MQTT_ENABLED:
         return
@@ -165,6 +222,16 @@ def publish_mqtt(site_id, data, sun_status=None):
         if sun_status:
             publisher.publish_sun_data(str(site_id), sun_status)
 
+        # Publish energy totals for HA Energy Dashboard
+        if energy_data:
+            publisher.publish_energy_data(str(site_id), energy_data)
+            logger.info(
+                f'MQTT energy: solar={energy_data["solar_energy_exported"]:.0f}Wh '
+                f'grid_in={energy_data["grid_energy_imported"]:.0f}Wh '
+                f'grid_out={energy_data["grid_energy_exported_from_solar"]:.0f}Wh '
+                f'batt_out={energy_data["battery_energy_exported"]:.0f}Wh'
+            )
+
         logger.info(
             f'MQTT: solar={data["solar_power"]:.0f}W '
             f'battery={data["battery_power"]:.0f}W '
@@ -180,7 +247,7 @@ def publish_mqtt(site_id, data, sun_status=None):
         publisher.disconnect()
 
 
-def publish_influxdb(site_id, data, sun_status=None):
+def publish_influxdb(site_id, data, sun_status=None, energy_data=None):
     """Publish live data point to InfluxDB."""
     if not Config.INFLUXDB_ENABLED:
         return
@@ -233,7 +300,22 @@ def publish_influxdb(site_id, data, sun_status=None):
             )
             write_api.write(bucket=Config.INFLUXDB_BUCKET, record=sun_point)
 
-        logger.info(f'InfluxDB: wrote power + soe + sun data at {ts}')
+        # Energy totals point
+        if energy_data:
+            energy_point = (
+                Point('tesla_solar_energy')
+                .tag('site_id', str(site_id))
+                .field('solar_energy_exported', float(energy_data.get('solar_energy_exported', 0)))
+                .field('grid_energy_imported', float(energy_data.get('grid_energy_imported', 0)))
+                .field('grid_energy_exported_from_solar', float(energy_data.get('grid_energy_exported_from_solar', 0)))
+                .field('battery_energy_exported', float(energy_data.get('battery_energy_exported', 0)))
+                .field('battery_energy_imported_from_solar', float(energy_data.get('battery_energy_imported_from_solar', 0)))
+                .field('consumer_energy_imported_from_solar', float(energy_data.get('consumer_energy_imported_from_solar', 0)))
+                .time(ts)
+            )
+            write_api.write(bucket=Config.INFLUXDB_BUCKET, record=energy_point)
+
+        logger.info(f'InfluxDB: wrote power + soe + sun + energy data at {ts}')
 
         client.close()
 
@@ -267,8 +349,11 @@ def run_poll_cycle(tesla, sites, sun_tracker):
             logger.warning(f'No data returned for site {obfuscated}')
             continue
 
-        publish_mqtt(site_id, data, sun_status)
-        publish_influxdb(site_id, data, sun_status)
+        # Poll energy totals (today's cumulative Wh)
+        energy_data = poll_energy_today(tesla, site_id)
+
+        publish_mqtt(site_id, data, sun_status, energy_data)
+        publish_influxdb(site_id, data, sun_status, energy_data)
 
 
 def main():
